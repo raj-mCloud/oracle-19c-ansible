@@ -1,151 +1,122 @@
+-- multiplex_redo_compact.sql
 SET SERVEROUTPUT ON SIZE UNLIMITED
-SET FEEDBACK OFF VERIFY OFF PAGES 0 LINES 300 TRIMSPOOL ON
+SET FEEDBACK OFF VERIFY OFF PAGES 0 LINES 300
 
 DECLARE
-  c_dg1 CONSTANT VARCHAR2(128) := '+REDODG1';
-  c_dg2 CONSTANT VARCHAR2(128) := '+REDODG2';
-  c_dg3 CONSTANT VARCHAR2(128) := '+REDODG3';
+  -- target ASM diskgroups
+  g1 CONSTANT VARCHAR2(64) := '+REDODG1';
+  g2 CONSTANT VARCHAR2(64) := '+REDODG2';
+  g3 CONSTANT VARCHAR2(64) := '+REDODG3';
 
-  c_max_attempts PLS_INTEGER := 40;
-  c_sleep_secs   PLS_INTEGER := 5;
+  -- polling
+  max_try PLS_INTEGER := 120;   -- attempts for each wait
+  nap     PLS_INTEGER := 5;     -- seconds between attempts
 
-  v_added        PLS_INTEGER := 0;
-  v_dropped      PLS_INTEGER := 0;
-  v_skipped      PLS_INTEGER := 0;
-
-  CURSOR c_logs IS
-    SELECT l.group#, l.thread#, l.status, l.bytes
-    FROM   v$log l
-    ORDER  BY l.group#;
-
-  PROCEDURE get_pair(p_group NUMBER, p_out1 OUT VARCHAR2, p_out2 OUT VARCHAR2) IS
-    v_key INTEGER := CASE WHEN MOD(p_group,3)=0 THEN 3 ELSE MOD(p_group,3) END;
+  -- map group -> (t1,t2) as (1,2),(2,3),(1,3)
+  PROCEDURE pair_for(p_grp NUMBER, t1 OUT VARCHAR2, t2 OUT VARCHAR2) IS
+    k PLS_INTEGER := CASE WHEN MOD(p_grp,3)=0 THEN 3 ELSE MOD(p_grp,3) END;
   BEGIN
-    IF v_key = 1 THEN p_out1 := c_dg1; p_out2 := c_dg2;       -- (1,2)
-    ELSIF v_key = 2 THEN p_out1 := c_dg2; p_out2 := c_dg3;    -- (2,3)
-    ELSE                  p_out1 := c_dg1; p_out2 := c_dg3;   -- (1,3)
+    IF k=1 THEN t1:=g1; t2:=g2;
+    ELSIF k=2 THEN t1:=g2; t2:=g3;
+    ELSE           t1:=g1; t2:=g3;
     END IF;
   END;
 
-  FUNCTION has_member_in_dg(p_group NUMBER, p_dg VARCHAR2) RETURN BOOLEAN IS
-    v_cnt PLS_INTEGER;
+  FUNCTION has_member(p_grp NUMBER, p_dg VARCHAR2) RETURN BOOLEAN IS v NUMBER;
   BEGIN
-    SELECT COUNT(*) INTO v_cnt
-    FROM   v$logfile
-    WHERE  group# = p_group
-    AND    member LIKE p_dg || '/%';
-    RETURN v_cnt > 0;
+    SELECT COUNT(*) INTO v FROM v$logfile
+     WHERE group#=p_grp AND member LIKE p_dg||'/%';
+    RETURN v>0;
   END;
 
-  FUNCTION count_valid_targets(p_group NUMBER, p_t1 VARCHAR2, p_t2 VARCHAR2) RETURN PLS_INTEGER IS
-    v_cnt PLS_INTEGER;
+  FUNCTION valid_targets(p_grp NUMBER, t1 VARCHAR2, t2 VARCHAR2) RETURN NUMBER IS v NUMBER;
   BEGIN
-    SELECT COUNT(*)
-      INTO v_cnt
-      FROM v$logfile
-     WHERE group# = p_group
-       AND status IS NULL
-       AND (member LIKE p_t1 || '/%' OR member LIKE p_t2 || '/%');
-    RETURN v_cnt;
+    -- VALID = status IS NULL
+    SELECT COUNT(*) INTO v FROM v$logfile
+     WHERE group#=p_grp AND status IS NULL
+       AND (member LIKE t1||'/%' OR member LIKE t2||'/%');
+    RETURN v;
   END;
+
+  PROCEDURE sw IS BEGIN EXECUTE IMMEDIATE 'ALTER SYSTEM SWITCH LOGFILE'; END;
 
 BEGIN
-  DBMS_OUTPUT.PUT_LINE('--- Redo multiplexing with safe validation of new members ---');
+  DBMS_OUTPUT.PUT_LINE('--- redo multiplexing (compact) ---');
 
-  FOR r IN c_logs LOOP
+  FOR r IN (SELECT group#, thread#, bytes FROM v$log ORDER BY group#) LOOP
     DECLARE
-      v_t1 VARCHAR2(128);
-      v_t2 VARCHAR2(128);
-      v_status VARCHAR2(20);
-      v_attempts PLS_INTEGER := 0;
-      v_total_members PLS_INTEGER;
-      v_non_target_count PLS_INTEGER;
-      v_valid_targets PLS_INTEGER;
+      t1 VARCHAR2(64); t2 VARCHAR2(64);
+      tries PLS_INTEGER; v NUMBER; s VARCHAR2(20);
+      tot NUMBER; dropped BOOLEAN;
     BEGIN
-      get_pair(r.group#, v_t1, v_t2);
-      DBMS_OUTPUT.PUT_LINE('Group '||r.group#||' thread='||r.thread#||
-                           ' status='||r.status||' sizeMB='||(r.bytes/1024/1024));
-      DBMS_OUTPUT.PUT_LINE('  Target pair: '||v_t1||', '||v_t2);
+      pair_for(r.group#, t1, t2);
+      DBMS_OUTPUT.PUT_LINE('Group '||r.group#||' targets: '||t1||','||t2);
 
-      IF NOT has_member_in_dg(r.group#, v_t1) THEN
-        EXECUTE IMMEDIATE 'ALTER DATABASE ADD LOGFILE MEMBER '''||v_t1||''' TO GROUP '||r.group#;
-        DBMS_OUTPUT.PUT_LINE('  Added member in '||v_t1);
-        v_added := v_added + 1;
+      -- add missing target members
+      IF NOT has_member(r.group#, t1) THEN
+        EXECUTE IMMEDIATE 'ALTER DATABASE ADD LOGFILE MEMBER '''||t1||''' TO GROUP '||r.group#;
+      END IF;
+      IF NOT has_member(r.group#, t2) THEN
+        EXECUTE IMMEDIATE 'ALTER DATABASE ADD LOGFILE MEMBER '''||t2||''' TO GROUP '||r.group#;
       END IF;
 
-      IF NOT has_member_in_dg(r.group#, v_t2) THEN
-        EXECUTE IMMEDIATE 'ALTER DATABASE ADD LOGFILE MEMBER '''||v_t2||''' TO GROUP '||r.group#;
-        DBMS_OUTPUT.PUT_LINE('  Added member in '||v_t2);
-        v_added := v_added + 1;
-      END IF;
-
-      v_attempts := 0;
-      v_valid_targets := count_valid_targets(r.group#, v_t1, v_t2);
-
-      WHILE v_valid_targets < 2 AND v_attempts < c_max_attempts LOOP
-        DBMS_OUTPUT.PUT_LINE('  Need VALID copies on targets (have '||v_valid_targets||'); SWITCH LOGFILE (attempt '||(v_attempts+1)||'/'||c_max_attempts||')');
-        EXECUTE IMMEDIATE 'ALTER SYSTEM SWITCH LOGFILE';
-        DBMS_LOCK.SLEEP(c_sleep_secs);
-        v_attempts := v_attempts + 1;
-        v_valid_targets := count_valid_targets(r.group#, v_t1, v_t2);
+      -- wait: both target members VALID
+      tries := 0; v := valid_targets(r.group#, t1, t2);
+      WHILE v<2 AND tries<max_try LOOP
+        sw; DBMS_LOCK.SLEEP(nap); tries := tries+1; v := valid_targets(r.group#, t1, t2);
       END LOOP;
+      IF v<2 THEN RAISE_APPLICATION_ERROR(-20001,'Timeout: 2 VALID members not reached for group '||r.group#); END IF;
 
-      IF v_valid_targets < 2 THEN
-        DBMS_OUTPUT.PUT_LINE('  WARN: Could not get two VALID target members yet; will not drop old members now.');
-        v_skipped := v_skipped + 1;
-        CONTINUE;
-      END IF;
-
-      SELECT status INTO v_status FROM v$log WHERE group# = r.group# AND thread# = r.thread#;
-
-      v_attempts := 0;
-      WHILE v_status NOT IN ('INACTIVE','UNUSED') AND v_attempts < c_max_attempts LOOP
-        DBMS_OUTPUT.PUT_LINE('  Group '||r.group#||' is '||v_status||'; SWITCH LOGFILE (attempt '||(v_attempts+1)||'/'||c_max_attempts||')');
-        EXECUTE IMMEDIATE 'ALTER SYSTEM SWITCH LOGFILE';
-        DBMS_LOCK.SLEEP(c_sleep_secs);
-        v_attempts := v_attempts + 1;
-        SELECT status INTO v_status FROM v$log WHERE group# = r.group# AND thread# = r.thread#;
+      -- wait: group INACTIVE/UNUSED
+      tries := 0; SELECT status INTO s FROM v$log WHERE group#=r.group# AND thread#=r.thread#;
+      WHILE s NOT IN ('INACTIVE','UNUSED') AND tries<max_try LOOP
+        sw; DBMS_LOCK.SLEEP(nap); tries := tries+1;
+        SELECT status INTO s FROM v$log WHERE group#=r.group# AND thread#=r.thread#;
       END LOOP;
+      IF s NOT IN ('INACTIVE','UNUSED') THEN RAISE_APPLICATION_ERROR(-20002,'Timeout: group '||r.group#||' not INACTIVE'); END IF;
 
-      IF v_status NOT IN ('INACTIVE','UNUSED') THEN
-        DBMS_OUTPUT.PUT_LINE('  WARN: Group stayed '||v_status||'; skip drop this run.');
-        v_skipped := v_skipped + 1;
-        CONTINUE;
-      END IF;
+      -- drop non-targets while keeping >=2
+      LOOP
+        dropped := FALSE;
+        SELECT COUNT(*) INTO tot FROM v$logfile WHERE group#=r.group#;
+        EXIT WHEN tot<=2;
 
-      SELECT COUNT(*) INTO v_non_target_count
-      FROM   v$logfile
-      WHERE  group# = r.group#
-      AND    NOT (member LIKE v_t1 || '/%' OR member LIKE v_t2 || '/%');
-
-      IF v_non_target_count > 0 THEN
-        FOR m IN (
-          SELECT member
-          FROM   v$logfile
-          WHERE  group# = r.group#
-          AND    NOT (member LIKE v_t1 || '/%' OR member LIKE v_t2 || '/%')
-          ORDER  BY member
+        FOR x IN (
+          SELECT member FROM v$logfile
+           WHERE group#=r.group# AND NOT (member LIKE t1||'/%' OR member LIKE t2||'/%')
+           ORDER BY member
         ) LOOP
-          SELECT COUNT(*) INTO v_total_members FROM v$logfile WHERE group# = r.group#;
-
-          IF v_total_members > 2 THEN
-            EXECUTE IMMEDIATE 'ALTER DATABASE DROP LOGFILE MEMBER '''||REPLACE(m.member, '''', '''''')||'''';
-            DBMS_OUTPUT.PUT_LINE('  Dropped non-target: '||m.member);
-            v_dropped := v_dropped + 1;
-          ELSE
-            DBMS_OUTPUT.PUT_LINE('  Keep: need ≥2 members; not dropping '||m.member);
-          END IF;
+          SELECT COUNT(*) INTO tot FROM v$logfile WHERE group#=r.group#;
+          EXIT WHEN tot<=2;
+          EXECUTE IMMEDIATE 'ALTER DATABASE DROP LOGFILE MEMBER '''||REPLACE(x.member,'''','''''')||'''';
+          dropped := TRUE;
         END LOOP;
+
+        EXIT WHEN dropped=FALSE; -- no non-targets left
+      END LOOP;
+
+      -- if still >2, trim to exactly 2 while keeping one in each target DG
+      SELECT COUNT(*) INTO tot FROM v$logfile WHERE group#=r.group#;
+      IF tot>2 THEN
+        DECLARE keep1 BOOLEAN:=FALSE; keep2 BOOLEAN:=FALSE;
+        BEGIN
+          FOR y IN (SELECT member FROM v$logfile WHERE group#=r.group# ORDER BY member) LOOP
+            SELECT COUNT(*) INTO tot FROM v$logfile WHERE group#=r.group#;
+            EXIT WHEN tot<=2;
+            IF    y.member LIKE t1||'/%' AND NOT keep1 THEN keep1:=TRUE; 
+            ELSIF y.member LIKE t2||'/%' AND NOT keep2 THEN keep2:=TRUE;
+            ELSE
+              EXECUTE IMMEDIATE 'ALTER DATABASE DROP LOGFILE MEMBER '''||REPLACE(y.member,'''','''''')||'''';
+            END IF;
+          END LOOP;
+        END;
       END IF;
 
+      DBMS_OUTPUT.PUT_LINE('  -> Group '||r.group#||' aligned to exactly two members on target DGs.');
     END;
   END LOOP;
 
-  DBMS_OUTPUT.PUT_LINE('--- Summary ---');
-  DBMS_OUTPUT.PUT_LINE('  Members added   : '||v_added);
-  DBMS_OUTPUT.PUT_LINE('  Members dropped : '||v_dropped);
-  DBMS_OUTPUT.PUT_LINE('  Groups deferred : '||v_skipped||' (not yet VALID/INACTIVE)');
-  DBMS_OUTPUT.PUT_LINE('STATUS: Completed.');
+  DBMS_OUTPUT.PUT_LINE('STATUS: done.');
 END;
 /
 EXIT
