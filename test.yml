@@ -1,1 +1,114 @@
-testing
+---
+- name: Set HugePages for Oracle 19c based on total SGA
+  hosts: db_servers
+  gather_facts: true
+  become: true
+
+  vars:
+    # change if needed
+    oracle_user: oracle
+    oracle_sysctl_file: /etc/sysctl.conf
+
+  tasks:
+    # 1) Get HugePage size from kernel, fallback to 2048 KB (2 MB)
+    - name: Read HugePage size (kB) from /proc/meminfo
+      shell: "awk '/Hugepagesize:/ {print $2}' /proc/meminfo"
+      args:
+        executable: /bin/bash
+      register: hugepagesize_kb_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Set HugePage size facts
+      set_fact:
+        hugepage_kb: "{{ (hugepagesize_kb_cmd.stdout | trim | int) if (hugepagesize_kb_cmd.stdout | trim | int) > 0 else 2048 }}"
+        hugepage_bytes: "{{ ((hugepagesize_kb_cmd.stdout | trim | int) if (hugepagesize_kb_cmd.stdout | trim | int) > 0 else 2048) * 1024 }}"
+
+    # 2) Query SGA bytes for each DB. Loop stays exactly as you had it.
+    - name: Get Oracle SGA bytes per DB
+      become_user: "{{ oracle_user }}"
+      shell: |
+        . ~/.bash_profile
+        export ORACLE_SID={{ item.name }}
+        sqlplus -s / as sysdba <<'SQL'
+        set heading off feedback off verify off echo off pages 0 lines 200
+        select to_char(trunc(sum(value))) from v$sga;
+        exit
+        SQL
+      args:
+        executable: /bin/bash
+      register: sga_query
+      changed_when: false
+      failed_when: false
+      loop: "{{ decoded_db_config.databases }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: decoded_db_config is defined
+
+    - name: Parse SGA values as integers
+      set_fact:
+        sga_values: >-
+          {{
+            sga_query.results
+            | map(attribute='stdout')
+            | map('regex_search', '([0-9]+)', '\1')
+            | map('default', '0')
+            | map('int')
+            | list
+          }}
+      when: decoded_db_config is defined
+
+    - name: Sum total SGA bytes
+      set_fact:
+        total_sga_bytes: "{{ sga_values | sum }}"
+      when: decoded_db_config is defined
+
+    - name: Fail if SGA could not be determined
+      fail:
+        msg: "Could not determine total SGA bytes from SQL output. Raw={{ sga_query.results | default([]) }}"
+      when:
+        - decoded_db_config is defined
+        - total_sga_bytes | int == 0
+
+    # 3) Compute target HugePages memory as 1.5x SGA. Cap by RAM minus fixed 2 GB headroom.
+    - name: Compute desired HugePages bytes (1.5x total SGA)
+      set_fact:
+        desired_huge_bytes_raw: "{{ ((total_sga_bytes | int) * 3 + 1) // 2 }}"
+
+    - name: Compute host memory and headroom
+      set_fact:
+        host_mem_bytes: "{{ (ansible_facts.memtotal_mb | int) * 1024 * 1024 }}"
+        headroom_bytes: "{{ 2048 * 1024 * 1024 }}"   # fixed 2 GB headroom
+        host_mem_usable_bytes: "{{ host_mem_bytes - (2048 * 1024 * 1024) }}"
+
+    - name: Cap desired HugePages bytes to RAM minus headroom
+      set_fact:
+        desired_huge_bytes: "{{ [desired_huge_bytes_raw | int, host_mem_usable_bytes | int] | min | max(0) }}"
+
+    # 4) Convert bytes to pages and persist
+    - name: Compute vm.nr_hugepages
+      set_fact:
+        desired_nr_hugepages: "{{ ((desired_huge_bytes | int) + (hugepage_bytes | int) - 1) // (hugepage_bytes | int) }}"
+
+    - name: Show calculation
+      debug:
+        msg:
+          - "DBs: {{ decoded_db_config.databases | map(attribute='name') | list }}"
+          - "Per DB SGA bytes: {{ sga_values }}"
+          - "Total SGA bytes: {{ total_sga_bytes }}"
+          - "HugePage size: {{ hugepage_kb }} kB ({{ hugepage_bytes }} bytes)"
+          - "Host RAM bytes: {{ host_mem_bytes }}"
+          - "Headroom bytes (fixed): {{ headroom_bytes }}"
+          - "Usable RAM for HugePages: {{ host_mem_usable_bytes }}"
+          - "Desired HugePages bytes raw (1.5x SGA): {{ desired_huge_bytes_raw }}"
+          - "Desired HugePages bytes capped: {{ desired_huge_bytes }}"
+          - "vm.nr_hugepages target: {{ desired_nr_hugepages }}"
+
+    - name: Persist vm.nr_hugepages to sysctl without reload
+      sysctl:
+        name: vm.nr_hugepages
+        value: "{{ desired_nr_hugepages | int }}"
+        state: present
+        reload: no
+        sysctl_file: "{{ oracle_sysctl_file }}"
+      when: desired_nr_hugepages | int >= 0
