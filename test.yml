@@ -5,38 +5,40 @@
   become: true
 
   vars:
-    # change if needed
     oracle_user: oracle
     oracle_sysctl_file: /etc/sysctl.conf
 
   tasks:
-    # 1) Get HugePage size from kernel, fallback to 2048 KB (2 MB)
+    # 1) Kernel HugePage size (fallback to 2048 KB if not available)
     - name: Read HugePage size (kB) from /proc/meminfo
       shell: "awk '/Hugepagesize:/ {print $2}' /proc/meminfo"
-      args:
-        executable: /bin/bash
+      args: { executable: /bin/bash }
       register: hugepagesize_kb_cmd
       changed_when: false
       failed_when: false
 
     - name: Set HugePage size facts
       set_fact:
-        hugepage_kb: "{{ (hugepagesize_kb_cmd.stdout | trim | int) if (hugepagesize_kb_cmd.stdout | trim | int) > 0 else 2048 }}"
-        hugepage_bytes: "{{ ((hugepagesize_kb_cmd.stdout | trim | int) if (hugepagesize_kb_cmd.stdout | trim | int) > 0 else 2048) * 1024 }}"
+        hugepage_kb: >-
+          {{
+            (hugepagesize_kb_cmd.stdout | trim | int)
+            if (hugepagesize_kb_cmd.stdout | trim | int) > 0
+            else 2048
+          }}
+        hugepage_bytes: "{{ (hugepage_kb | int) * 1024 }}"
 
-    # 2) Query SGA bytes for each DB. Loop stays exactly as you had it.
+    # 2) Query SGA (bytes) for each DB (loop unchanged)
     - name: Get Oracle SGA bytes per DB
       become_user: "{{ oracle_user }}"
       shell: |
         . ~/.bash_profile
         export ORACLE_SID={{ item.name }}
         sqlplus -s / as sysdba <<'SQL'
-        set heading off feedback off verify off echo off pages 0 lines 200
+        set heading off feedback off verify off echo off pages 0 lines 200;
         select to_char(trunc(sum(value))) from v$sga;
         exit
         SQL
-      args:
-        executable: /bin/bash
+      args: { executable: /bin/bash }
       register: sga_query
       changed_when: false
       failed_when: false
@@ -45,13 +47,15 @@
         label: "{{ item.name }}"
       when: decoded_db_config is defined
 
+    # 3) Robust parse: strip non-digits → int
     - name: Parse SGA values as integers
       set_fact:
         sga_values: >-
           {{
             sga_query.results
             | map(attribute='stdout')
-            | map('regex_search', '([0-9]+)', '\1')
+            | map('trim')
+            | map('regex_replace', '[^0-9]', '')
             | map('default', '0')
             | map('int')
             | list
@@ -65,32 +69,36 @@
 
     - name: Fail if SGA could not be determined
       fail:
-        msg: "Could not determine total SGA bytes from SQL output. Raw={{ sga_query.results | default([]) }}"
+        msg: "Could not determine total SGA bytes. Raw SQL outputs={{ sga_query.results | default([]) }}"
       when:
         - decoded_db_config is defined
-        - total_sga_bytes | int == 0
+        - (total_sga_bytes | int) == 0
 
-    # 3) Compute target HugePages memory as 1.5x SGA. Cap by RAM minus fixed 2 GB headroom.
+    # 4) Compute target HugePages: 1.5 × total SGA, cap by RAM minus fixed 2GB headroom
     - name: Compute desired HugePages bytes (1.5x total SGA)
       set_fact:
         desired_huge_bytes_raw: "{{ ((total_sga_bytes | int) * 3 + 1) // 2 }}"
 
-    - name: Compute host memory and headroom
+    - name: Compute host memory, fixed headroom, and usable RAM
       set_fact:
         host_mem_bytes: "{{ (ansible_facts.memtotal_mb | int) * 1024 * 1024 }}"
-        headroom_bytes: "{{ 2048 * 1024 * 1024 }}"   # fixed 2 GB headroom
+        headroom_bytes: "{{ 2048 * 1024 * 1024 }}"          # fixed 2 GB headroom
         host_mem_usable_bytes: "{{ host_mem_bytes - (2048 * 1024 * 1024) }}"
 
-    - name: Cap desired HugePages bytes to RAM minus headroom
+    - name: Cap desired HugePages bytes to usable RAM
       set_fact:
         desired_huge_bytes: "{{ [desired_huge_bytes_raw | int, host_mem_usable_bytes | int] | min | max(0) }}"
 
-    # 4) Convert bytes to pages and persist
+    # 5) Convert bytes → pages and persist to sysctl (no reload; reboot later)
     - name: Compute vm.nr_hugepages
       set_fact:
-        desired_nr_hugepages: "{{ ((desired_huge_bytes | int) + (hugepage_bytes | int) - 1) // (hugepage_bytes | int) }}"
+        desired_nr_hugepages: >-
+          {{
+            ((desired_huge_bytes | int) + (hugepage_bytes | int) - 1)
+            // (hugepage_bytes | int)
+          }}
 
-    - name: Show calculation
+    - name: Show calculation summary
       debug:
         msg:
           - "DBs: {{ decoded_db_config.databases | map(attribute='name') | list }}"
@@ -102,7 +110,7 @@
           - "Usable RAM for HugePages: {{ host_mem_usable_bytes }}"
           - "Desired HugePages bytes raw (1.5x SGA): {{ desired_huge_bytes_raw }}"
           - "Desired HugePages bytes capped: {{ desired_huge_bytes }}"
-          - "vm.nr_hugepages target: {{ desired_nr_hugepages }}"
+          - "vm.nr_hugepages target (pages): {{ desired_nr_hugepages }}"
 
     - name: Persist vm.nr_hugepages to sysctl without reload
       sysctl:
