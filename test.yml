@@ -4,29 +4,18 @@
   gather_facts: true
   become: true
 
-  vars:
-    oracle_user: oracle
-    oracle_sysctl_file: /etc/sysctl.conf
-
   tasks:
-    # 1) Kernel HugePage size with robust fallback to 2048 KB
-    - name: Read HugePage size (kB) from /proc/meminfo
-      ansible.builtin.shell: "awk '/Hugepagesize:/ {print $2}' /proc/meminfo"
-      args:
-        executable: /bin/bash
-      register: hugepagesize_kb_cmd
-      changed_when: false
-      failed_when: false
-
-    - name: Set HugePage size facts (always define)
+    # Constants: no extra vars, just facts once
+    - name: Define HugePages constants
       ansible.builtin.set_fact:
-        hugepage_kb_raw: "{{ hugepagesize_kb_cmd.stdout | default('') | trim | int }}"
-        hugepage_kb: "{{ (hugepage_kb_raw | int) if (hugepage_kb_raw | int) > 0 else 2048 }}"
-        hugepage_bytes: "{{ (hugepage_kb | int) * 1024 }}"
+        hugepage_kb: 2048                               # 2 MB
+        hugepage_bytes: "{{ 2048 * 1024 }}"             # 2,097,152 bytes
+        headroom_bytes: "{{ 2 * 1024 * 1024 * 1024 }}"  # 2 GB OS headroom
+        sysctl_path: /etc/sysctl.conf
 
-    # 2) Query SGA bytes per DB (loop unchanged)
+    # Query SGA bytes per DB (loop unchanged)
     - name: Get Oracle SGA bytes per DB
-      become_user: "{{ oracle_user }}"
+      become_user: oracle
       ansible.builtin.shell: |
         . ~/.bash_profile
         export ORACLE_SID={{ item.name }}
@@ -45,8 +34,8 @@
         label: "{{ item.name }}"
       when: decoded_db_config is defined
 
-    # 3) Robust parsing: strip non-digits, convert to int
-    - name: Parse SGA values as integers
+    # Extract SGA values from sqlplus output
+    - name: Parse SGA values
       ansible.builtin.set_fact:
         sga_values: >-
           {{
@@ -54,49 +43,39 @@
             | map(attribute='stdout')
             | map('trim')
             | map('regex_replace', '[^0-9]', '')
-            | map('default', '0')
             | map('int')
             | list
           }}
       when: decoded_db_config is defined
 
-    - name: Sum total SGA bytes
+    # Sum total SGA
+    - name: Calculate total SGA bytes
       ansible.builtin.set_fact:
         total_sga_bytes: "{{ sga_values | sum }}"
       when: decoded_db_config is defined
 
-    - name: Fail if SGA could not be determined
+    - name: Fail if total SGA is zero
       ansible.builtin.fail:
         msg: "Could not determine total SGA bytes. Raw SQL outputs={{ sga_query.results | default([]) }}"
       when:
         - decoded_db_config is defined
-        - (total_sga_bytes | int) == 0
+        - total_sga_bytes | int == 0
 
-    # 4) Compute target HugePages: 1.5x total SGA, cap by RAM minus fixed 2 GB headroom
-    - name: Compute desired HugePages bytes (1.5x total SGA)
+    # 1.5 × total SGA, cap by RAM minus 2 GB headroom
+    - name: Compute HugePages target (bytes)
       ansible.builtin.set_fact:
         desired_huge_bytes_raw: "{{ ((total_sga_bytes | int) * 3 + 1) // 2 }}"
-
-    - name: Compute host memory, fixed headroom, and usable RAM
-      ansible.builtin.set_fact:
         host_mem_bytes: "{{ (ansible_facts.memtotal_mb | int) * 1024 * 1024 }}"
-        headroom_bytes: "{{ 2048 * 1024 * 1024 }}"   # fixed 2 GB headroom
-        host_mem_usable_bytes: "{{ host_mem_bytes - (2048 * 1024 * 1024) }}"
+        usable_ram_bytes: "{{ host_mem_bytes - headroom_bytes }}"
+        desired_huge_bytes: "{{ [desired_huge_bytes_raw, usable_ram_bytes] | min | max(0) }}"
 
-    - name: Cap desired HugePages bytes to usable RAM
-      ansible.builtin.set_fact:
-        desired_huge_bytes: "{{ [desired_huge_bytes_raw | int, host_mem_usable_bytes | int] | min | max(0) }}"
-
-    # 5) Convert bytes to pages and persist to sysctl (no reload; reboot later)
+    # Convert bytes to pages
     - name: Compute vm.nr_hugepages
       ansible.builtin.set_fact:
-        desired_nr_hugepages: >-
-          {{
-            ((desired_huge_bytes | int) + (hugepage_bytes | int) - 1)
-            // (hugepage_bytes | int)
-          }}
+        desired_nr_hugepages: "{{ (desired_huge_bytes + hugepage_bytes - 1) // hugepage_bytes }}"
 
-    - name: Show calculation summary
+    # Summary
+    - name: Show HugePages calculation summary
       ansible.builtin.debug:
         msg:
           - "DBs: {{ decoded_db_config.databases | map(attribute='name') | list }}"
@@ -104,17 +83,18 @@
           - "Total SGA bytes: {{ total_sga_bytes }}"
           - "HugePage size: {{ hugepage_kb }} kB ({{ hugepage_bytes }} bytes)"
           - "Host RAM bytes: {{ host_mem_bytes }}"
-          - "Headroom bytes (fixed): {{ headroom_bytes }}"
-          - "Usable RAM for HugePages: {{ host_mem_usable_bytes }}"
+          - "Headroom bytes: {{ headroom_bytes }}"
+          - "Usable RAM bytes: {{ usable_ram_bytes }}"
           - "Desired HugePages bytes raw (1.5x SGA): {{ desired_huge_bytes_raw }}"
           - "Desired HugePages bytes capped: {{ desired_huge_bytes }}"
           - "vm.nr_hugepages target (pages): {{ desired_nr_hugepages }}"
 
-    - name: Persist vm.nr_hugepages to sysctl without reload
+    # Persist (effective after reboot)
+    - name: Persist vm.nr_hugepages to sysctl
       ansible.builtin.sysctl:
         name: vm.nr_hugepages
         value: "{{ desired_nr_hugepages | int }}"
         state: present
         reload: no
-        sysctl_file: "{{ oracle_sysctl_file }}"
+        sysctl_file: "{{ sysctl_path }}"
       when: desired_nr_hugepages | int >= 0
